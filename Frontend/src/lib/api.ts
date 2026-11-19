@@ -1,4 +1,4 @@
-import type { AnalysisResult, AuthResponse, Favorite, HistoryRecord, PricePoint, User } from '../types'
+import type { AnalysisResult, AuthResponse, Favorite, HistoryRecord, Notification, PricePoint, User } from '../types'
 
 export const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3000'
 const TOKEN_KEY = 'baixou_token'
@@ -30,6 +30,11 @@ export const api = {
   login: (body: { email: string; senha: string }) => request<AuthResponse>('/api/auth/login', { method: 'POST', body: JSON.stringify(body) }),
   me: () => request<User>('/api/auth/me'),
   favorites: () => request<Favorite[]>('/api/favoritos'),
-  addFavorite: (body: { modelo_chave: string; titulo_loja: string; loja: string; url: string; preco_salvo: number }) => request<Favorite>('/api/favoritos', { method: 'POST', body: JSON.stringify(body) }),
+  addFavorite: (body: { modelo_chave: string; titulo_loja: string; loja: string; url: string; preco_salvo: number; preco_alvo?: number; webhook_url?: string }) => request<Favorite>('/api/favoritos', { method: 'POST', body: JSON.stringify(body) }),
+  updateFavorite: (id: number, body: { preco_alvo: number | null; webhook_url: string | null }) => request<unknown>(`/api/favoritos/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   removeFavorite: (id: number) => request<void>(`/api/favoritos/${id}`, { method: 'DELETE' }),
+  notifications: () => request<Notification[]>('/api/notificacoes'),
+  markNotificationRead: (id: number) => request<void>(`/api/notificacoes/${id}/ler`, { method: 'PATCH' }),
+  markAllNotificationsRead: () => request<void>('/api/notificacoes/ler-todas', { method: 'POST' }),
+  verifyWorker: () => request<{ ok: boolean; alertas_disparados: number; mensagem: string }>('/api/worker/verificar', { method: 'POST' }),
 }

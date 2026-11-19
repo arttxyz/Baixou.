@@ -2,7 +2,7 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap as AxumHeaderMap, StatusCode},
     response::IntoResponse,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -124,6 +124,14 @@ struct NovoFavoritoRequest {
     loja: String,
     url: String,
     preco_salvo: f64,
+    preco_alvo: Option<f64>,
+    webhook_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AtualizarAlertaRequest {
+    preco_alvo: Option<f64>,
+    webhook_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -134,8 +142,37 @@ struct FavoritoItem {
     loja: String,
     url: String,
     preco_salvo: f64,
+    preco_alvo: Option<f64>,
+    webhook_url: Option<String>,
+    alerta_disparado: bool,
     menor_preco_atual: f64,
     criado_em: String,
+}
+
+#[derive(Serialize)]
+struct NotificacaoItem {
+    id: i64,
+    modelo_chave: String,
+    titulo_loja: String,
+    loja: String,
+    url: String,
+    preco_encontrado: f64,
+    preco_alvo: f64,
+    mensagem: String,
+    lida: bool,
+    criado_em: String,
+}
+
+#[derive(Clone)]
+struct TarefaMonitoramento {
+    favorito_id: i64,
+    usuario_id: i64,
+    modelo_chave: String,
+    titulo_loja: String,
+    loja: String,
+    url: String,
+    preco_alvo: f64,
+    webhook_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -155,6 +192,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
     });
 
+    // Inicia o Worker em segundo plano para monitorar preços-alvo automaticamente
+    let state_worker = Arc::clone(&state);
+    tokio::spawn(async move {
+        // Aguarda 30 segundos após o boot antes da primeira rodada automática
+        tokio::time::sleep(StdDuration::from_secs(30)).await;
+        loop {
+            println!("\n[WORKER] Iniciando varredura automática de alertas de preço-alvo...");
+            let disparados = executar_ciclo_monitoramento(&state_worker).await;
+            println!(
+                "[WORKER] Ciclo concluído. {} novo(s) alerta(s) disparado(s).",
+                disparados
+            );
+            // Repete a cada 2 horas
+            tokio::time::sleep(StdDuration::from_secs(7200)).await;
+        }
+    });
+
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -170,17 +224,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/auth/register", post(api_register))
         .route("/api/auth/login", post(api_login))
         .route("/api/auth/me", get(api_me))
-        // Rotas de Favoritos / Monitoramento do Usuário
+        // Rotas de Favoritos e Metas de Preço
         .route("/api/favoritos", get(api_listar_favoritos).post(api_salvar_favorito))
-        .route("/api/favoritos/:id", delete(api_remover_favorito))
+        .route(
+            "/api/favoritos/:id",
+            patch(api_atualizar_alerta_favorito).delete(api_remover_favorito),
+        )
+        // Rotas de Notificações In-App e Disparo Manual do Worker
+        .route("/api/notificacoes", get(api_listar_notificacoes))
+        .route("/api/notificacoes/:id/ler", patch(api_marcar_notificacao_lida))
+        .route("/api/notificacoes/ler-todas", post(api_marcar_todas_lidas))
+        .route("/api/worker/verificar", post(api_forcar_verificacao_alertas))
         .layer(cors)
         .with_state(state);
 
     let endereco = "0.0.0.0:3000";
     println!("=========================================================");
-    println!("   BAIXOU API REST FULL-STACK ONLINE (PORTA 3000)        ");
-    println!("   Banco SQLite: {} (Auth + Histórico + Favoritos) ", ARQUIVO_BANCO);
-    println!("   Pronto para conectar ao Frontend React/Vite           ");
+    println!("   BAIXOU API v3 ONLINE (PORTA 3000)                     ");
+    println!("   • SQLite: {}                                  ", ARQUIVO_BANCO);
+    println!("   • Worker de Alertas de Preço-Alvo: ATIVO              ");
     println!("=========================================================");
 
     let listener = tokio::net::TcpListener::bind(endereco).await?;
@@ -192,9 +254,239 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "online",
-        "servico": "Baixou API v2",
-        "docs": "Conecte seu frontend React/Vite em http://localhost:3000"
+        "servico": "Baixou API v3 (Alertas & Worker Ativos)"
     }))
+}
+
+// =========================================================================
+// MOTOR DE ALERTAS E WORKER EM SEGUNDO PLANO
+// =========================================================================
+
+async fn api_forcar_verificacao_alertas(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let total = executar_ciclo_monitoramento(&state).await;
+    Json(serde_json::json!({
+        "ok": true,
+        "alertas_disparados": total,
+        "mensagem": format!("Varredura concluída. {} alerta(s) disparado(s).", total)
+    }))
+}
+
+async fn executar_ciclo_monitoramento(state: &Arc<AppState>) -> usize {
+    let tarefas: Vec<TarefaMonitoramento> = {
+        let conn = state.db.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, usuario_id, modelo_chave, titulo_loja, loja, url, preco_alvo, webhook_url
+             FROM favoritos
+             WHERE preco_alvo IS NOT NULL AND preco_alvo > 0 AND alerta_disparado = 0",
+        ) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(TarefaMonitoramento {
+                    favorito_id: row.get(0)?,
+                    usuario_id: row.get(1)?,
+                    modelo_chave: row.get(2)?,
+                    titulo_loja: row.get(3)?,
+                    loja: row.get(4)?,
+                    url: row.get(5)?,
+                    preco_alvo: row.get(6)?,
+                    webhook_url: row.get(7)?,
+                })
+            })
+            .ok();
+
+        match rows {
+            Some(iter) => iter.filter_map(Result::ok).collect(),
+            None => Vec::new(),
+        }
+    };
+
+    let mut alertas_disparados = 0;
+
+    for tarefa in tarefas {
+        let nicho = detectar_nicho(&tarefa.url);
+        let loja = identificar_loja(&tarefa.url);
+
+        if let Ok(atualizado) =
+            extrair_produto_da_url(&state.client, &tarefa.url, loja, &nicho).await
+        {
+            // Grava a nova leitura no histórico para alimentar os gráficos
+            {
+                let conn = state.db.lock().unwrap();
+                let _ = inserir_registro(&conn, &atualizado);
+            }
+
+            if atualizado.preco <= tarefa.preco_alvo {
+                disparar_alerta_preco(state, &tarefa, atualizado.preco, &atualizado.url).await;
+                alertas_disparados += 1;
+            }
+        }
+    }
+
+    alertas_disparados
+}
+
+async fn disparar_alerta_preco(
+    state: &Arc<AppState>,
+    tarefa: &TarefaMonitoramento,
+    preco_encontrado: f64,
+    url_oferta: &str,
+) {
+    let msg = format!(
+        "Meta atingida! {} baixou para R$ {:.2} na {} (seu alvo era R$ {:.2}).",
+        tarefa.modelo_chave, preco_encontrado, tarefa.loja, tarefa.preco_alvo
+    );
+    let agora = Utc::now().to_rfc3339();
+
+    {
+        let conn = state.db.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO notificacoes (usuario_id, modelo_chave, titulo_loja, loja, url, preco_encontrado, preco_alvo, mensagem, lida, criado_em)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+            params![
+                tarefa.usuario_id,
+                tarefa.modelo_chave,
+                tarefa.titulo_loja,
+                tarefa.loja,
+                url_oferta,
+                preco_encontrado,
+                tarefa.preco_alvo,
+                msg,
+                agora
+            ],
+        );
+
+        let _ = conn.execute(
+            "UPDATE favoritos SET alerta_disparado = 1 WHERE id = ?1",
+            params![tarefa.favorito_id],
+        );
+    }
+
+    println!("  🔔 [ALERTA DISPARADO] {}", msg);
+
+    // Se o usuário configurou um Webhook (Discord / Slack), envia o card externo
+    if let Some(ref webhook) = tarefa.webhook_url {
+        let wh = webhook.trim();
+        if wh.starts_with("http") {
+            let payload = serde_json::json!({
+                "username": "Baixou Radar",
+                "embeds": [{
+                    "title": format!("🔥 Alerta de Preço-Alvo: {}", tarefa.modelo_chave),
+                    "description": msg,
+                    "url": url_oferta,
+                    "color": 1096065,
+                    "fields": [
+                        { "name": "Loja", "value": tarefa.loja, "inline": true },
+                        { "name": "Preço Atual", "value": format!("R$ {:.2}", preco_encontrado), "inline": true },
+                        { "name": "Seu Alvo", "value": format!("R$ {:.2}", tarefa.preco_alvo), "inline": true }
+                    ]
+                }]
+            });
+
+            let _ = state.client.post(wh).json(&payload).send().await;
+        }
+    }
+}
+
+// =========================================================================
+// ROTAS DE NOTIFICAÇÕES IN-APP
+// =========================================================================
+
+async fn api_listar_notificacoes(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Faça login para ver suas notificações.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, modelo_chave, titulo_loja, loja, url, preco_encontrado, preco_alvo, mensagem, lida, criado_em
+             FROM notificacoes
+             WHERE usuario_id = ?1
+             ORDER BY id DESC
+             LIMIT 25",
+        )
+        .unwrap();
+
+    let rows = stmt
+        .query_map(params![usuario.id], |row| {
+            let lida_int: i64 = row.get(8)?;
+            Ok(NotificacaoItem {
+                id: row.get(0)?,
+                modelo_chave: row.get(1)?,
+                titulo_loja: row.get(2)?,
+                loja: row.get(3)?,
+                url: row.get(4)?,
+                preco_encontrado: row.get(5)?,
+                preco_alvo: row.get(6)?,
+                mensagem: row.get(7)?,
+                lida: lida_int != 0,
+                criado_em: row.get(9)?,
+            })
+        })
+        .unwrap();
+
+    let lista: Vec<NotificacaoItem> = rows.filter_map(Result::ok).collect();
+    (StatusCode::OK, Json(lista)).into_response()
+}
+
+async fn api_marcar_notificacao_lida(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+    Path(notif_id): Path<i64>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Não autorizado.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let _ = conn.execute(
+        "UPDATE notificacoes SET lida = 1 WHERE id = ?1 AND usuario_id = ?2",
+        params![notif_id, usuario.id],
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+async fn api_marcar_todas_lidas(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Não autorizado.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let _ = conn.execute(
+        "UPDATE notificacoes SET lida = 1 WHERE usuario_id = ?1",
+        params![usuario.id],
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
 // =========================================================================
@@ -370,7 +662,7 @@ async fn api_me(
 }
 
 // =========================================================================
-// FAVORITOS / LISTA DE MONITORAMENTO DO USUÁRIO
+// FAVORITOS / LISTA DE MONITORAMENTO E METAS DE PREÇO
 // =========================================================================
 
 async fn api_listar_favoritos(
@@ -390,7 +682,7 @@ async fn api_listar_favoritos(
 
     let mut stmt = conn
         .prepare(
-            "SELECT id, modelo_chave, titulo_loja, loja, url, preco_salvo, criado_em
+            "SELECT id, modelo_chave, titulo_loja, loja, url, preco_salvo, preco_alvo, webhook_url, alerta_disparado, criado_em
              FROM favoritos
              WHERE usuario_id = ?1
              ORDER BY id DESC",
@@ -401,6 +693,7 @@ async fn api_listar_favoritos(
         .query_map(params![usuario.id], |row| {
             let modelo: String = row.get(1)?;
             let preco_salvo: f64 = row.get(5)?;
+            let disparado_int: i64 = row.get(8)?;
 
             let menor_atual: f64 = conn
                 .query_row(
@@ -418,19 +711,16 @@ async fn api_listar_favoritos(
                 loja: row.get(3)?,
                 url: row.get(4)?,
                 preco_salvo,
+                preco_alvo: row.get(6)?,
+                webhook_url: row.get(7)?,
+                alerta_disparado: disparado_int != 0,
                 menor_preco_atual: menor_atual,
-                criado_em: row.get(6)?,
+                criado_em: row.get(9)?,
             })
         })
         .unwrap();
 
-    let mut lista = Vec::new();
-    for item in rows {
-        if let Ok(fav) = item {
-            lista.push(fav);
-        }
-    }
-
+    let lista: Vec<FavoritoItem> = rows.filter_map(Result::ok).collect();
     (StatusCode::OK, Json(lista)).into_response()
 }
 
@@ -439,45 +729,133 @@ async fn api_salvar_favorito(
     headers: AxumHeaderMap,
     Json(payload): Json<NovoFavoritoRequest>,
 ) -> impl IntoResponse {
+    let tarefa_imediata = {
+        let conn = state.db.lock().unwrap();
+        let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErroResponse {
+                    erro: "Faça login para salvar produtos na sua lista.".to_string(),
+                }),
+            )
+                .into_response();
+        };
+
+        let agora = Utc::now().to_rfc3339();
+        let webhook_limpo = payload
+            .webhook_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        if let Err(e) = conn.execute(
+            "INSERT INTO favoritos (usuario_id, modelo_chave, titulo_loja, loja, url, preco_salvo, preco_alvo, webhook_url, alerta_disparado, criado_em)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9)",
+            params![
+                usuario.id,
+                payload.modelo_chave,
+                payload.titulo_loja,
+                payload.loja,
+                payload.url,
+                payload.preco_salvo,
+                payload.preco_alvo,
+                webhook_limpo,
+                agora
+            ],
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErroResponse {
+                    erro: format!("Erro ao salvar favorito: {}", e),
+                }),
+            )
+                .into_response();
+        }
+
+        let fav_id = conn.last_insert_rowid();
+
+        // Verifica se já existe preço no banco menor ou igual ao alvo definido
+        if let Some(alvo) = payload.preco_alvo {
+            if alvo > 0.0 {
+                let menor_no_banco: f64 = conn
+                    .query_row(
+                        "SELECT MIN(preco) FROM historico_precos WHERE modelo_chave = ?1",
+                        params![payload.modelo_chave],
+                        |r| r.get::<_, Option<f64>>(0),
+                    )
+                    .unwrap_or(None)
+                    .unwrap_or(payload.preco_salvo);
+
+                if menor_no_banco <= alvo {
+                    Some((
+                        TarefaMonitoramento {
+                            favorito_id: fav_id,
+                            usuario_id: usuario.id,
+                            modelo_chave: payload.modelo_chave.clone(),
+                            titulo_loja: payload.titulo_loja.clone(),
+                            loja: payload.loja.clone(),
+                            url: payload.url.clone(),
+                            preco_alvo: alvo,
+                            webhook_url: webhook_limpo,
+                        },
+                        menor_no_banco,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    if let Some((tarefa, preco_encontrado)) = tarefa_imediata {
+        disparar_alerta_preco(&state, &tarefa, preco_encontrado, &tarefa.url).await;
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn api_atualizar_alerta_favorito(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+    Path(fav_id): Path<i64>,
+    Json(payload): Json<AtualizarAlertaRequest>,
+) -> impl IntoResponse {
     let conn = state.db.lock().unwrap();
     let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ErroResponse {
-                erro: "Faça login para salvar produtos na sua lista.".to_string(),
+                erro: "Não autorizado.".to_string(),
             }),
         )
             .into_response();
     };
 
-    let agora = Utc::now().to_rfc3339();
-    if let Err(e) = conn.execute(
-        "INSERT INTO favoritos (usuario_id, modelo_chave, titulo_loja, loja, url, preco_salvo, criado_em)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            usuario.id,
-            payload.modelo_chave,
-            payload.titulo_loja,
-            payload.loja,
-            payload.url,
-            payload.preco_salvo,
-            agora
-        ],
-    ) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErroResponse {
-                erro: format!("Erro ao salvar favorito: {}", e),
-            }),
-        )
-            .into_response();
-    }
+    let webhook_limpo = payload
+        .webhook_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({ "ok": true, "id": conn.last_insert_rowid() })),
-    )
-        .into_response()
+    // Ao editar a meta de preço, reativa o monitoramento (alerta_disparado = 0)
+    let _ = conn.execute(
+        "UPDATE favoritos
+         SET preco_alvo = ?1, webhook_url = ?2, alerta_disparado = 0
+         WHERE id = ?3 AND usuario_id = ?4",
+        params![payload.preco_alvo, webhook_limpo, fav_id, usuario.id],
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
 
 async fn api_remover_favorito(
@@ -568,7 +946,7 @@ async fn api_analisar_link(
     let ofertas_encontradas =
         buscar_nas_lojas_confiaveis(&state.client, &produto_alvo, &nicho).await;
 
-    let (registros_30d, historico_grafico) = {
+    let (registros_30d, historico_grafico, alertas_pendentes) = {
         let conn = state.db.lock().unwrap();
         for oferta in &ofertas_encontradas {
             if oferta.categoria_match == "MESMO MODELO" {
@@ -577,8 +955,47 @@ async fn api_analisar_link(
         }
         let r30 = buscar_historico_30_dias(&conn, &produto_alvo.modelo_chave).unwrap_or_default();
         let graf = buscar_serie_grafico(&conn, &produto_alvo.modelo_chave).unwrap_or_default();
-        (r30, graf)
+
+        // Verifica se algum usuário tem meta de preço para esse modelo que acabou de ser batida
+        let menor_agora = r30
+            .iter()
+            .map(|r| r.preco)
+            .fold(produto_alvo.preco, f64::min);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, usuario_id, modelo_chave, titulo_loja, loja, url, preco_alvo, webhook_url
+                 FROM favoritos
+                 WHERE modelo_chave = ?1 AND preco_alvo IS NOT NULL AND preco_alvo >= ?2 AND alerta_disparado = 0",
+            )
+            .unwrap();
+
+        let pendentes: Vec<(TarefaMonitoramento, f64)> = stmt
+            .query_map(params![produto_alvo.modelo_chave, menor_agora], |row| {
+                Ok((
+                    TarefaMonitoramento {
+                        favorito_id: row.get(0)?,
+                        usuario_id: row.get(1)?,
+                        modelo_chave: row.get(2)?,
+                        titulo_loja: row.get(3)?,
+                        loja: row.get(4)?,
+                        url: row.get(5)?,
+                        preco_alvo: row.get(6)?,
+                        webhook_url: row.get(7)?,
+                    },
+                    menor_agora,
+                ))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+
+        (r30, graf, pendentes)
     };
+
+    for (tarefa, preco_atingido) in alertas_pendentes {
+        disparar_alerta_preco(&state, &tarefa, preco_atingido, &produto_alvo.url).await;
+    }
 
     let media_30d = if registros_30d.is_empty() {
         produto_alvo.preco
@@ -660,7 +1077,7 @@ async fn api_analisar_link(
 }
 
 // =========================================================================
-// CAMADA DE BANCO DE DADOS (SQLITE)
+// CAMADA DE BANCO DE DADOS (SQLITE + MIGRAÇÃO AUTOMÁTICA)
 // =========================================================================
 
 fn inicializar_banco() -> Result<Connection, rusqlite::Error> {
@@ -713,6 +1130,34 @@ fn inicializar_banco() -> Result<Connection, rusqlite::Error> {
             loja TEXT NOT NULL,
             url TEXT NOT NULL,
             preco_salvo REAL NOT NULL,
+            preco_alvo REAL,
+            webhook_url TEXT,
+            alerta_disparado INTEGER NOT NULL DEFAULT 0,
+            criado_em TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // Migração segura caso a tabela favoritos já tenha sido criada na v2
+    let _ = conn.execute("ALTER TABLE favoritos ADD COLUMN preco_alvo REAL", []);
+    let _ = conn.execute("ALTER TABLE favoritos ADD COLUMN webhook_url TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE favoritos ADD COLUMN alerta_disparado INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notificacoes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
+            modelo_chave TEXT NOT NULL,
+            titulo_loja TEXT NOT NULL,
+            loja TEXT NOT NULL,
+            url TEXT NOT NULL,
+            preco_encontrado REAL NOT NULL,
+            preco_alvo REAL NOT NULL,
+            mensagem TEXT NOT NULL,
+            lida INTEGER NOT NULL DEFAULT 0,
             criado_em TEXT NOT NULL
         )",
         [],

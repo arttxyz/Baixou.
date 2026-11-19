@@ -46,6 +46,22 @@ export type Favorite = {
   url: string
   preco_salvo: number
   menor_preco_atual: number
+  preco_alvo: number | null
+  webhook_url: string | null
+  alerta_disparado: boolean
+  criado_em: string
+}
+
+export type Notification = {
+  id: number
+  modelo_chave: string
+  titulo_loja: string
+  loja: string
+  url: string
+  preco_encontrado: number
+  preco_alvo: number
+  mensagem: string
+  lida: boolean
   criado_em: string
 }
 
