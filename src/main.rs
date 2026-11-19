@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loja_origem, nicho
         );
 
-        match extrair_produto_da_url(&client, url, loja_origem).await {
+        match extrair_produto_da_url(&client, url, loja_origem, &nicho).await {
             Ok(produto_alvo) => {
                 println!(
                     "  ✓ Produto: {}\n  ✓ Modelo identificado: {}\n  ✓ Preço atual na {}: R$ {:.2}",
@@ -87,7 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ofertas_encontradas =
                     buscar_nas_lojas_confiaveis(&client, &produto_alvo, &nicho).await;
 
-                // Salva no histórico apenas ofertas do MESMO MODELO para manter a média de 30 dias fiel
                 for oferta in &ofertas_encontradas {
                     if oferta.categoria_match == "MESMO MODELO" {
                         historico.push(oferta.registro.clone());
@@ -180,23 +179,18 @@ async fn extrair_produto_da_url(
     client: &reqwest::Client,
     url: &str,
     loja: &str,
+    nicho: &Nicho,
 ) -> Result<RegistroPreco, String> {
     let html_content = baixar_html_resiliente(client, url).await?;
     let documento = Html::parse_document(&html_content);
 
-    let seletor_titulo = Selector::parse("h1").unwrap();
-    let titulo_loja = documento
-        .select(&seletor_titulo)
-        .next()
-        .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "Produto sem título".to_string());
+    let titulo_loja = extrair_titulo_completo(&documento);
 
     let preco = extrair_preco_html(&documento).ok_or_else(|| {
         "Preço não localizado (item esgotado ou bloqueio Cloudflare ativo na loja).".to_string()
     })?;
 
-    let modelo_chave = extrair_modelo_inteligente(&titulo_loja);
+    let modelo_chave = extrair_modelo_inteligente(&titulo_loja, nicho);
 
     Ok(RegistroPreco {
         modelo_chave,
@@ -208,44 +202,172 @@ async fn extrair_produto_da_url(
     })
 }
 
-// Isola marca + modelo exato removendo categoria, especificações técnicas e códigos de fábrica
-fn extrair_modelo_inteligente(titulo: &str) -> String {
-    // 1. Placas de Vídeo (ex: RTX 5060, RTX 4070 Ti, RX 7800 XT)
-    let re_gpu = Regex::new(r"(?i)\b(rtx|gtx|rx|arc)\s*\d{3,4}(\s*(ti|super|xt|xtx))?\b").unwrap();
-    if let Some(m) = re_gpu.find(titulo) {
-        return m
-            .as_str()
-            .to_uppercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+// Extrai o título completo mesmo quando a loja (como a Farfetch) coloca só a marca no <h1>
+fn extrair_titulo_completo(documento: &Html) -> String {
+    let seletor_h1 = Selector::parse("h1").unwrap();
+    let titulo_h1 = documento
+        .select(&seletor_h1)
+        .next()
+        .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
+        .unwrap_or_default();
+
+    // Tenta extrair marca + nome do produto direto do JSON-LD
+    let mut titulo_json_ld = String::new();
+    if let Ok(sel_ld) = Selector::parse(r#"script[type="application/ld+json"]"#) {
+        for script in documento.select(&sel_ld) {
+            if let Ok(json) = serde_json::from_str::<Value>(&script.inner_html()) {
+                if let Some(nome_completo) = extrair_nome_produto_json(&json) {
+                    titulo_json_ld = nome_completo;
+                    break;
+                }
+            }
+        }
     }
 
-    // 2. Processadores (ex: Ryzen 7 5700X3D, Core i5-14600K)
-    let re_cpu =
-        Regex::new(r"(?i)\b(ryzen\s*\d\s*\d{4}[a-z0-9]*|core\s*i\d[-\s]*\d{4,5}[a-z]*)\b").unwrap();
-    if let Some(m) = re_cpu.find(titulo) {
-        return m
-            .as_str()
-            .to_uppercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+    // Fallback via og:title (limpando sufixos como " | FARFETCH" ou " - Droper")
+    let mut titulo_og = String::new();
+    if let Ok(sel_og) = Selector::parse(r#"meta[property="og:title"]"#) {
+        if let Some(el) = documento.select(&sel_og).next() {
+            if let Some(content) = el.value().attr("content") {
+                titulo_og = content
+                    .split('|')
+                    .next()
+                    .unwrap_or(content)
+                    .split(" - ")
+                    .next()
+                    .unwrap_or(content)
+                    .trim()
+                    .to_string();
+            }
+        }
     }
 
-    // 3. Para periféricos (mouses, teclados, headsets) e moda (tênis, roupas):
-    // Corta especificações após vírgula (ex: ", 30000 DPI, Preto") e código após " - "
+    // Escolhe o título mais descritivo (evita ficar preso só em "Nike" quando o H1 é curto)
+    if titulo_h1.split_whitespace().count() >= 3 {
+        titulo_h1
+    } else if !titulo_json_ld.is_empty() {
+        titulo_json_ld
+    } else if !titulo_og.is_empty() {
+        titulo_og
+    } else if !titulo_h1.is_empty() {
+        titulo_h1
+    } else {
+        "Produto sem título".to_string()
+    }
+}
+
+fn extrair_nome_produto_json(json: &Value) -> Option<String> {
+    if let Some(obj) = json.as_object() {
+        if obj.get("@type").and_then(|t| t.as_str()) == Some("Product") {
+            let nome = obj.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let marca = obj
+                .get("brand")
+                .and_then(|b| {
+                    b.as_str()
+                        .or_else(|| b.get("name").and_then(|n| n.as_str()))
+                })
+                .unwrap_or("")
+                .trim();
+
+            if !nome.is_empty() {
+                if !marca.is_empty() && !nome.to_lowercase().contains(&marca.to_lowercase()) {
+                    return Some(format!("{} {}", marca, nome));
+                }
+                return Some(nome.to_string());
+            }
+        }
+        if let Some(graph) = obj.get("@graph").and_then(|g| g.as_array()) {
+            for item in graph {
+                if let Some(res) = extrair_nome_produto_json(item) {
+                    return Some(res);
+                }
+            }
+        }
+    } else if let Some(arr) = json.as_array() {
+        for item in arr {
+            if let Some(res) = extrair_nome_produto_json(item) {
+                return Some(res);
+            }
+        }
+    }
+    None
+}
+
+fn extrair_modelo_inteligente(titulo: &str, nicho: &Nicho) -> String {
+    if *nicho == Nicho::Tecnologia {
+        // 1. Placas de Vídeo
+        let re_gpu =
+            Regex::new(r"(?i)\b(rtx|gtx|rx|arc)\s*\d{3,4}(\s*(ti|super|xt|xtx))?\b").unwrap();
+        if let Some(m) = re_gpu.find(titulo) {
+            return m
+                .as_str()
+                .to_uppercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+
+        // 2. Processadores
+        let re_cpu =
+            Regex::new(r"(?i)\b(ryzen\s*\d\s*\d{4}[a-z0-9]*|core\s*i\d[-\s]*\d{4,5}[a-z]*)\b")
+                .unwrap();
+        if let Some(m) = re_cpu.find(titulo) {
+            return m
+                .as_str()
+                .to_uppercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    } else {
+        // 3. Silhuetas clássicas de Sneakers & Streetwear
+        let re_sneaker = Regex::new(
+            r"(?i)\b(air\s*jordan\s*\d{1,2}(\s*(low|mid|high))?|dunk\s*(low|high)(\s*retro|\s*sb)?|air\s*force\s*1(\s*(low|mid|high))?|air\s*max\s*\d{2,3}|samba\s*(og|xl)?|campus\s*00s|gazelle(\s*indoor)?|yeezy\s*(boost\s*)?\d{3,4}|new\s*balance\s*\d{3,4}[a-z]?|gel-[a-z0-9-]+)\b",
+        )
+        .unwrap();
+
+        if let Some(m) = re_sneaker.find(titulo) {
+            let silhueta = m
+                .as_str()
+                .to_uppercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            // Mantém a marca junto da silhueta se ela estiver no início do título (ex: NIKE DUNK LOW)
+            let primeira_palavra = titulo
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_uppercase();
+
+            let marcas_conhecidas = ["NIKE", "ADIDAS", "JORDAN", "ASICS", "PUMA", "VANS", "CONVERSE"];
+            if marcas_conhecidas.contains(&primeira_palavra.as_str())
+                && !silhueta.starts_with(&primeira_palavra)
+            {
+                return format!("{} {}", primeira_palavra, silhueta);
+            }
+            return silhueta;
+        }
+    }
+
+    // 4. Fallback limpo para outros produtos de moda ou periféricos
     let base_sem_virgula = titulo.split(',').next().unwrap_or(titulo);
-    let base_limpa = base_sem_virgula.split(" - ").next().unwrap_or(base_sem_virgula);
+    let base_limpa = base_sem_virgula
+        .split(" - ")
+        .next()
+        .unwrap_or(base_sem_virgula);
 
     let ignorar = [
         "mouse", "gamer", "sem", "fio", "wireless", "teclado", "mecanico", "mecânico",
         "headset", "fone", "ouvido", "monitor", "cadeira", "placa", "de", "vídeo", "video",
         "processador", "memória", "memoria", "ssd", "hd", "fonte", "gabinete", "water",
-        "cooler", "tênis", "tenis", "camiseta", "jaqueta", "moletom", "calça", "calca",
-        "boné", "bone", "bolsa", "com", "para", "em", "e", "da", "do", "na", "no",
-        "preto", "branco", "rosa", "azul", "vermelho", "cinza", "rgb", "led", "usb",
-        "bluetooth", "masculino", "feminino", "unissex", "edicao", "edição", "especial",
+        "cooler", "tênis", "tenis", "sneaker", "sapato", "camiseta", "jaqueta", "moletom",
+        "calça", "calca", "boné", "bone", "bolsa", "com", "para", "em", "e", "da", "do",
+        "na", "no", "preto", "branco", "rosa", "azul", "vermelho", "cinza", "verde", "bege",
+        "rgb", "led", "usb", "bluetooth", "masculino", "feminino", "unissex", "edicao",
+        "edição", "especial", "cano", "baixo", "alto",
     ];
 
     let palavras_uteis: Vec<String> = base_limpa
@@ -262,7 +384,6 @@ fn extrair_modelo_inteligente(titulo: &str) -> String {
     }
 }
 
-// Avalia se um produto encontrado na loja corresponde ao modelo buscado ou é semelhante
 fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option<&'static str> {
     let tokens_alvo: Vec<String> = modelo_chave
         .split(|c: char| !c.is_alphanumeric())
@@ -280,6 +401,14 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
         .map(|w| w.to_uppercase())
         .collect();
 
+    // Bloqueia acessórios (cadarços, meias, kits de limpeza) quando a busca não é por um acessório
+    let acessorios = ["CADARCO", "CADARÇO", "MEIA", "MEIAS", "LIMPADOR", "PALMILHA", "CHAVEIRO", "PROTETOR"];
+    let alvo_eh_acessorio = tokens_alvo.iter().any(|t| acessorios.contains(&t.as_str()));
+    let cand_eh_acessorio = tokens_cand.iter().any(|t| acessorios.contains(&t.as_str()));
+    if !alvo_eh_acessorio && cand_eh_acessorio {
+        return None;
+    }
+
     let mut acertos = 0;
     for alvo in &tokens_alvo {
         if tokens_cand.iter().any(|c| c == alvo) {
@@ -287,8 +416,6 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
         }
     }
 
-    // Exige pelo menos 2 palavras-chave em comum quando o modelo tem 2 ou mais termos
-    // (evita que "Redragon Invader Pro" dê match apenas pela palavra "PRO")
     if tokens_alvo.len() >= 2 && acertos < 2 {
         return None;
     }
@@ -299,8 +426,9 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
         return None;
     }
 
-    // Verifica se o candidato possui sufixos de variante diferentes (ex: HyperSpeed, Lite, Mini, Ti, Super)
-    let variantes = ["HYPERSPEED", "LITE", "MINI", "TI", "SUPER", "SE", "NEO", "ESSENTIAL"];
+    let variantes = [
+        "HYPERSPEED", "LITE", "MINI", "TI", "SUPER", "SE", "NEO", "ESSENTIAL", "NEXT", "PRO", "SB",
+    ];
     let variante_diferente = variantes.iter().any(|&v| {
         let cand_tem = tokens_cand.iter().any(|t| t == v);
         let alvo_tem = tokens_alvo.iter().any(|t| t == v);
@@ -336,6 +464,9 @@ async fn buscar_nas_lojas_confiaveis(
         ],
     };
 
+    // Piso mínimo de 25% do valor original para evitar brindes/cadarços/caixas vazias
+    let preco_minimo_valido = (alvo.preco * 0.25).max(40.0);
+
     for (loja, url_busca) in lojas_busca {
         print!("  -> Pesquisando na {}... ", loja);
         let _ = io::stdout().flush();
@@ -348,8 +479,9 @@ async fn buscar_nas_lojas_confiaveis(
                     extrair_resultados_genericos(&html, loja, &url_busca, &alvo.modelo_chave)
                 };
 
-                // Remove o link exato colado pelo usuário e valores inválidos
-                itens.retain(|i| i.registro.url != alvo.url && i.registro.preco > 40.0);
+                itens.retain(|i| {
+                    i.registro.url != alvo.url && i.registro.preco >= preco_minimo_valido
+                });
 
                 if itens.is_empty() {
                     println!("nenhum anúncio compatível encontrado.");
@@ -412,7 +544,8 @@ fn coletar_produtos_kabum_json(val: &Value, modelo_chave: &str, lista: &mut Vec<
 
             if preco > 0.0 {
                 if let Some(categoria_match) = avaliar_compatibilidade(modelo_chave, nome) {
-                    let url_produto = format!("https://www.kabum.com.br/produto/{}/{}", code, friendly);
+                    let url_produto =
+                        format!("https://www.kabum.com.br/produto/{}/{}", code, friendly);
                     if !lista.iter().any(|item| item.registro.url == url_produto) {
                         lista.push(OfertaComparada {
                             registro: RegistroPreco {
@@ -447,6 +580,7 @@ fn extrair_resultados_genericos(
 ) -> Vec<OfertaComparada> {
     let mut encontrados = Vec::new();
     let doc = Html::parse_document(html);
+    let dominio_base = obter_dominio_base(loja);
 
     // 1. Tenta via JSON-LD ItemList da busca
     if let Ok(sel_ld) = Selector::parse(r#"script[type="application/ld+json"]"#) {
@@ -454,9 +588,18 @@ fn extrair_resultados_genericos(
             if let Ok(json) = serde_json::from_str::<Value>(&script.inner_html()) {
                 if let Some(items) = json["itemListElement"].as_array() {
                     for item in items.iter().take(25) {
-                        let prod = if item["item"].is_object() { &item["item"] } else { item };
+                        let prod = if item["item"].is_object() {
+                            &item["item"]
+                        } else {
+                            item
+                        };
                         let nome = prod["name"].as_str().unwrap_or("");
-                        let link = prod["url"].as_str().unwrap_or(url_base);
+                        let href = prod["url"].as_str().unwrap_or(url_base);
+                        let link = if href.starts_with("http") {
+                            href.to_string()
+                        } else {
+                            format!("{}{}", dominio_base, href)
+                        };
 
                         if let Some(categoria_match) = avaliar_compatibilidade(modelo_chave, nome) {
                             if let Some(preco) = prod.get("offers").and_then(extrair_valor_oferta) {
@@ -466,7 +609,7 @@ fn extrair_resultados_genericos(
                                             modelo_chave: modelo_chave.to_string(),
                                             titulo_loja: nome.to_string(),
                                             loja: loja.to_string(),
-                                            url: link.to_string(),
+                                            url: link,
                                             preco,
                                             data: Utc::now(),
                                         },
@@ -484,7 +627,6 @@ fn extrair_resultados_genericos(
     // 2. Fallback: varre os cards de links filtrando estritamente pela compatibilidade do modelo
     if encontrados.is_empty() {
         let re_preco = Regex::new(r"R\$\s*(\d{1,3}(?:\.\d{3})*,\d{2})").unwrap();
-        let dominio_base = obter_dominio_base(loja);
 
         if let Ok(sel_a) = Selector::parse("a[href]") {
             for a in doc.select(&sel_a) {
