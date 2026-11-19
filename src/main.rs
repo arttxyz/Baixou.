@@ -2,14 +2,13 @@ use chrono::{DateTime, Duration, Utc};
 use headless_chrome::{Browser, LaunchOptions};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+use rusqlite::{params, Connection};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 use std::thread;
 use std::time::Duration as StdDuration;
 
@@ -35,15 +34,21 @@ enum Nicho {
     Moda,
 }
 
-const ARQUIVO_HISTORICO: &str = "historico_precos.json";
+struct FonteBusca {
+    nome: &'static str,
+    categoria: &'static str,
+    url_busca: String,
+}
+
+const ARQUIVO_BANCO: &str = "baixou.db";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut historico = carregar_historico();
+    let conn = inicializar_banco()?;
     let client = criar_cliente_http();
 
     println!("=========================================================");
-    println!("   RADAR AUTOMÁTICO BLACK FRIDAY (TECH & FASHION)        ");
+    println!("   BAIXOU - RADAR MULTI-LOJAS & MARKETPLACES (SQLITE)    ");
     println!("=========================================================");
 
     loop {
@@ -77,10 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     produto_alvo.preco
                 );
 
-                historico.push(produto_alvo.clone());
+                inserir_registro(&conn, &produto_alvo)?;
 
                 println!(
-                    "\n[2/3] Varrendo outras lojas confiáveis por '{}'...",
+                    "\n[2/3] Varrendo varejistas, marketplaces e lojas high-end por '{}'...",
                     produto_alvo.modelo_chave
                 );
 
@@ -89,14 +94,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 for oferta in &ofertas_encontradas {
                     if oferta.categoria_match == "MESMO MODELO" {
-                        historico.push(oferta.registro.clone());
+                        inserir_registro(&conn, &oferta.registro)?;
                     }
                 }
 
-                salvar_historico(&historico)?;
-
-                println!("\n[3/3] Gerando veredito...");
-                gerar_veredito_completo(&historico, &produto_alvo, &ofertas_encontradas);
+                println!("\n[3/3] Consultando histórico de 30 dias no SQLite...");
+                gerar_veredito_completo(&conn, &produto_alvo, &ofertas_encontradas)?;
             }
             Err(erro) => {
                 println!("  [ERRO] Não foi possível analisar o link enviado: {}", erro);
@@ -106,6 +109,90 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// =========================================================================
+// CAMADA DE BANCO DE DADOS (SQLITE)
+// =========================================================================
+
+fn inicializar_banco() -> Result<Connection, rusqlite::Error> {
+    let conn = Connection::open(ARQUIVO_BANCO)?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS historico_precos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            modelo_chave TEXT NOT NULL,
+            titulo_loja TEXT NOT NULL,
+            loja TEXT NOT NULL,
+            url TEXT NOT NULL,
+            preco REAL NOT NULL,
+            data_coleta TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_modelo_data ON historico_precos (modelo_chave, data_coleta)",
+        [],
+    )?;
+
+    Ok(conn)
+}
+
+fn inserir_registro(conn: &Connection, reg: &RegistroPreco) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO historico_precos (modelo_chave, titulo_loja, loja, url, preco, data_coleta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            reg.modelo_chave,
+            reg.titulo_loja,
+            reg.loja,
+            reg.url,
+            reg.preco,
+            reg.data.to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn buscar_historico_30_dias(
+    conn: &Connection,
+    modelo_chave: &str,
+) -> Result<Vec<RegistroPreco>, rusqlite::Error> {
+    let limite_30_dias = (Utc::now() - Duration::days(30)).to_rfc3339();
+
+    let mut stmt = conn.prepare(
+        "SELECT modelo_chave, titulo_loja, loja, url, preco, data_coleta
+         FROM historico_precos
+         WHERE modelo_chave = ?1 AND data_coleta >= ?2",
+    )?;
+
+    let linhas = stmt.query_map(params![modelo_chave, limite_30_dias], |row| {
+        let data_str: String = row.get(5)?;
+        let data_parseada = DateTime::parse_from_rfc3339(&data_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+
+        Ok(RegistroPreco {
+            modelo_chave: row.get(0)?,
+            titulo_loja: row.get(1)?,
+            loja: row.get(2)?,
+            url: row.get(3)?,
+            preco: row.get(4)?,
+            data: data_parseada,
+        })
+    })?;
+
+    let mut registros = Vec::new();
+    for item in linhas {
+        registros.push(item?);
+    }
+
+    Ok(registros)
+}
+
+// =========================================================================
+// MOTOR DE CONEXÃO RESILIENTE (HTTP + CHROME STEALTH)
+// =========================================================================
 
 fn criar_cliente_http() -> reqwest::Client {
     let mut headers = HeaderMap::new();
@@ -133,7 +220,10 @@ async fn baixar_html_resiliente(client: &reqwest::Client, url: &str) -> Result<S
     if let Ok(resp) = client.get(url).send().await {
         if resp.status().is_success() {
             if let Ok(texto) = resp.text().await {
-                if !texto.contains("Just a moment...") && texto.len() > 2000 {
+                if !texto.contains("Just a moment...")
+                    && !texto.contains("Type the characters you see in this image")
+                    && texto.len() > 2500
+                {
                     return Ok(texto);
                 }
             }
@@ -175,6 +265,10 @@ async fn baixar_html_resiliente(client: &reqwest::Client, url: &str) -> Result<S
     .map_err(|e| format!("Erro de thread: {}", e))?
 }
 
+// =========================================================================
+// EXTRAÇÃO DO LINK ENVIADO PELO USUÁRIO
+// =========================================================================
+
 async fn extrair_produto_da_url(
     client: &reqwest::Client,
     url: &str,
@@ -187,7 +281,7 @@ async fn extrair_produto_da_url(
     let titulo_loja = extrair_titulo_completo(&documento);
 
     let preco = extrair_preco_html(&documento).ok_or_else(|| {
-        "Preço não localizado (item esgotado ou bloqueio Cloudflare ativo na loja).".to_string()
+        "Preço não localizado (item esgotado ou bloqueio anti-bot ativo na loja).".to_string()
     })?;
 
     let modelo_chave = extrair_modelo_inteligente(&titulo_loja, nicho);
@@ -202,7 +296,6 @@ async fn extrair_produto_da_url(
     })
 }
 
-// Extrai o título completo mesmo quando a loja (como a Farfetch) coloca só a marca no <h1>
 fn extrair_titulo_completo(documento: &Html) -> String {
     let seletor_h1 = Selector::parse("h1").unwrap();
     let titulo_h1 = documento
@@ -211,7 +304,6 @@ fn extrair_titulo_completo(documento: &Html) -> String {
         .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
         .unwrap_or_default();
 
-    // Tenta extrair marca + nome do produto direto do JSON-LD
     let mut titulo_json_ld = String::new();
     if let Ok(sel_ld) = Selector::parse(r#"script[type="application/ld+json"]"#) {
         for script in documento.select(&sel_ld) {
@@ -224,7 +316,6 @@ fn extrair_titulo_completo(documento: &Html) -> String {
         }
     }
 
-    // Fallback via og:title (limpando sufixos como " | FARFETCH" ou " - Droper")
     let mut titulo_og = String::new();
     if let Ok(sel_og) = Selector::parse(r#"meta[property="og:title"]"#) {
         if let Some(el) = documento.select(&sel_og).next() {
@@ -242,7 +333,6 @@ fn extrair_titulo_completo(documento: &Html) -> String {
         }
     }
 
-    // Escolhe o título mais descritivo (evita ficar preso só em "Nike" quando o H1 é curto)
     if titulo_h1.split_whitespace().count() >= 3 {
         titulo_h1
     } else if !titulo_json_ld.is_empty() {
@@ -320,7 +410,7 @@ fn extrair_modelo_inteligente(titulo: &str, nicho: &Nicho) -> String {
                 .join(" ");
         }
     } else {
-        // 3. Silhuetas clássicas de Sneakers & Streetwear
+        // 3. Silhuetas de Sneakers & Streetwear
         let re_sneaker = Regex::new(
             r"(?i)\b(air\s*jordan\s*\d{1,2}(\s*(low|mid|high))?|dunk\s*(low|high)(\s*retro|\s*sb)?|air\s*force\s*1(\s*(low|mid|high))?|air\s*max\s*\d{2,3}|samba\s*(og|xl)?|campus\s*00s|gazelle(\s*indoor)?|yeezy\s*(boost\s*)?\d{3,4}|new\s*balance\s*\d{3,4}[a-z]?|gel-[a-z0-9-]+)\b",
         )
@@ -334,7 +424,6 @@ fn extrair_modelo_inteligente(titulo: &str, nicho: &Nicho) -> String {
                 .collect::<Vec<_>>()
                 .join(" ");
 
-            // Mantém a marca junto da silhueta se ela estiver no início do título (ex: NIKE DUNK LOW)
             let primeira_palavra = titulo
                 .split_whitespace()
                 .next()
@@ -352,7 +441,7 @@ fn extrair_modelo_inteligente(titulo: &str, nicho: &Nicho) -> String {
         }
     }
 
-    // 4. Fallback limpo para outros produtos de moda ou periféricos
+    // 4. Periféricos High-End, Hardware geral e demais peças
     let base_sem_virgula = titulo.split(',').next().unwrap_or(titulo);
     let base_limpa = base_sem_virgula
         .split(" - ")
@@ -360,20 +449,21 @@ fn extrair_modelo_inteligente(titulo: &str, nicho: &Nicho) -> String {
         .unwrap_or(base_sem_virgula);
 
     let ignorar = [
-        "mouse", "gamer", "sem", "fio", "wireless", "teclado", "mecanico", "mecânico",
-        "headset", "fone", "ouvido", "monitor", "cadeira", "placa", "de", "vídeo", "video",
-        "processador", "memória", "memoria", "ssd", "hd", "fonte", "gabinete", "water",
-        "cooler", "tênis", "tenis", "sneaker", "sapato", "camiseta", "jaqueta", "moletom",
-        "calça", "calca", "boné", "bone", "bolsa", "com", "para", "em", "e", "da", "do",
-        "na", "no", "preto", "branco", "rosa", "azul", "vermelho", "cinza", "verde", "bege",
-        "rgb", "led", "usb", "bluetooth", "masculino", "feminino", "unissex", "edicao",
-        "edição", "especial", "cano", "baixo", "alto",
+        "mouse", "mousepad", "gamer", "sem", "fio", "wireless", "teclado", "mecanico",
+        "mecânico", "magnetico", "magnético", "headset", "fone", "ouvido", "monitor",
+        "cadeira", "placa", "de", "vídeo", "video", "processador", "memória", "memoria",
+        "ssd", "hd", "fonte", "gabinete", "water", "cooler", "tênis", "tenis", "sneaker",
+        "sapato", "camiseta", "jaqueta", "moletom", "calça", "calca", "boné", "bone",
+        "bolsa", "com", "para", "em", "e", "da", "do", "na", "no", "preto", "branco",
+        "rosa", "azul", "vermelho", "cinza", "verde", "bege", "rgb", "led", "usb",
+        "bluetooth", "masculino", "feminino", "unissex", "edicao", "edição", "especial",
+        "cano", "baixo", "alto", "ultra", "leve", "esports",
     ];
 
     let palavras_uteis: Vec<String> = base_limpa
         .split(|c: char| !c.is_alphanumeric() && c != '-')
         .filter(|w| !w.is_empty() && !ignorar.contains(&w.to_lowercase().as_str()))
-        .take(4)
+        .take(5)
         .map(|w| w.to_uppercase())
         .collect();
 
@@ -401,10 +491,14 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
         .map(|w| w.to_uppercase())
         .collect();
 
-    // Bloqueia acessórios (cadarços, meias, kits de limpeza) quando a busca não é por um acessório
-    let acessorios = ["CADARCO", "CADARÇO", "MEIA", "MEIAS", "LIMPADOR", "PALMILHA", "CHAVEIRO", "PROTETOR"];
-    let alvo_eh_acessorio = tokens_alvo.iter().any(|t| acessorios.contains(&t.as_str()));
-    let cand_eh_acessorio = tokens_cand.iter().any(|t| acessorios.contains(&t.as_str()));
+    // Bloqueia acessórios e peças de reposição (skates, grips, switches, cadarços, caixas)
+    let bloqueados = [
+        "CADARCO", "CADARÇO", "MEIA", "MEIAS", "LIMPADOR", "PALMILHA", "CHAVEIRO",
+        "PROTETOR", "FEET", "SKATES", "GRIP", "TAPE", "DONGLE", "RECEPTOR", "CABO",
+        "SWITCHES", "KEYCAPS", "CASE", "CAPA",
+    ];
+    let alvo_eh_acessorio = tokens_alvo.iter().any(|t| bloqueados.contains(&t.as_str()));
+    let cand_eh_acessorio = tokens_cand.iter().any(|t| bloqueados.contains(&t.as_str()));
     if !alvo_eh_acessorio && cand_eh_acessorio {
         return None;
     }
@@ -427,7 +521,8 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
     }
 
     let variantes = [
-        "HYPERSPEED", "LITE", "MINI", "TI", "SUPER", "SE", "NEO", "ESSENTIAL", "NEXT", "PRO", "SB",
+        "HYPERSPEED", "LITE", "MINI", "TI", "SUPER", "SE", "NEO", "ESSENTIAL", "NEXT",
+        "PRO", "SB", "MAX", "PLUS", "8K",
     ];
     let variante_diferente = variantes.iter().any(|&v| {
         let cand_tem = tokens_cand.iter().any(|t| t == v);
@@ -442,6 +537,10 @@ fn avaliar_compatibilidade(modelo_chave: &str, titulo_candidato: &str) -> Option
     }
 }
 
+// =========================================================================
+// BUSCA MULTI-LOJAS, MARKETPLACES E HIGH-END
+// =========================================================================
+
 async fn buscar_nas_lojas_confiaveis(
     client: &reqwest::Client,
     alvo: &RegistroPreco,
@@ -449,34 +548,92 @@ async fn buscar_nas_lojas_confiaveis(
 ) -> Vec<OfertaComparada> {
     let mut resultados = Vec::new();
     let termo_encoded = urlencoding::encode(&alvo.modelo_chave).to_string();
-    let slug_kabum = alvo.modelo_chave.to_lowercase().replace(' ', "-");
+    let slug_hifen = alvo.modelo_chave.to_lowercase().replace(' ', "-");
 
-    let lojas_busca: Vec<(&str, String)> = match nicho {
+    let fontes: Vec<FonteBusca> = match nicho {
         Nicho::Tecnologia => vec![
-            ("Kabum", format!("https://www.kabum.com.br/busca/{}", slug_kabum)),
-            ("Pichau", format!("https://www.pichau.com.br/search?q={}", termo_encoded)),
-            ("Terabyte", format!("https://www.terabyteshop.com.br/busca?str={}", termo_encoded)),
+            FonteBusca {
+                nome: "Kabum",
+                categoria: "Varejo Tech",
+                url_busca: format!("https://www.kabum.com.br/busca/{}", slug_hifen),
+            },
+            FonteBusca {
+                nome: "Pichau",
+                categoria: "Varejo Tech",
+                url_busca: format!("https://www.pichau.com.br/search?q={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "Terabyte",
+                categoria: "Varejo Tech",
+                url_busca: format!("https://www.terabyteshop.com.br/busca?str={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "Amazon BR",
+                categoria: "Marketplace",
+                url_busca: format!("https://www.amazon.com.br/s?k={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "Mercado Livre",
+                categoria: "Marketplace",
+                url_busca: format!("https://lista.mercadolivre.com.br/{}", slug_hifen),
+            },
+            FonteBusca {
+                nome: "Doctor Mouse",
+                categoria: "High-End Gear",
+                url_busca: format!("https://www.doctormouse.com.br/search/?q={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "VTR Imports",
+                categoria: "High-End Gear",
+                url_busca: format!("https://www.vtrimports.com.br/search/?q={}", termo_encoded),
+            },
         ],
         Nicho::Moda => vec![
-            ("Farfetch", format!("https://www.farfetch.com/br/shopping/men/search/items.aspx?q={}", termo_encoded)),
-            ("Droper", format!("https://droper.app/busca?q={}", termo_encoded)),
-            ("Maze", format!("https://www.maze.com.br/busca?q={}", termo_encoded)),
+            FonteBusca {
+                nome: "Farfetch",
+                categoria: "Luxury & Fashion",
+                url_busca: format!(
+                    "https://www.farfetch.com/br/shopping/men/search/items.aspx?q={}",
+                    termo_encoded
+                ),
+            },
+            FonteBusca {
+                nome: "Droper",
+                categoria: "Streetwear",
+                url_busca: format!("https://droper.app/busca?q={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "Maze",
+                categoria: "Streetwear",
+                url_busca: format!("https://www.maze.com.br/busca?q={}", termo_encoded),
+            },
+            FonteBusca {
+                nome: "Mercado Livre",
+                categoria: "Marketplace",
+                url_busca: format!("https://lista.mercadolivre.com.br/{}", slug_hifen),
+            },
         ],
     };
 
-    // Piso mínimo de 25% do valor original para evitar brindes/cadarços/caixas vazias
-    let preco_minimo_valido = (alvo.preco * 0.25).max(40.0);
+    // Piso mínimo de 35% do preço original para bloquear peças avulsas/acessórios baratos
+    let preco_minimo_valido = (alvo.preco * 0.35).max(45.0);
 
-    for (loja, url_busca) in lojas_busca {
-        print!("  -> Pesquisando na {}... ", loja);
+    for fonte in fontes {
+        print!("  -> [{}] {}... ", fonte.categoria, fonte.nome);
         let _ = io::stdout().flush();
 
-        match baixar_html_resiliente(client, &url_busca).await {
+        match baixar_html_resiliente(client, &fonte.url_busca).await {
             Ok(html) => {
-                let mut itens = if loja == "Kabum" {
-                    extrair_resultados_kabum(&html, &alvo.modelo_chave)
-                } else {
-                    extrair_resultados_genericos(&html, loja, &url_busca, &alvo.modelo_chave)
+                let mut itens = match fonte.nome {
+                    "Kabum" => extrair_resultados_kabum(&html, &alvo.modelo_chave),
+                    "Amazon BR" => extrair_resultados_amazon(&html, &alvo.modelo_chave),
+                    "Mercado Livre" => extrair_resultados_mercadolivre(&html, &alvo.modelo_chave),
+                    _ => extrair_resultados_lojas_especializadas(
+                        &html,
+                        fonte.nome,
+                        &fonte.url_busca,
+                        &alvo.modelo_chave,
+                    ),
                 };
 
                 itens.retain(|i| {
@@ -484,9 +641,9 @@ async fn buscar_nas_lojas_confiaveis(
                 });
 
                 if itens.is_empty() {
-                    println!("nenhum anúncio compatível encontrado.");
+                    println!("nenhuma oferta compatível.");
                 } else {
-                    println!("{} ofertas compatíveis encontradas!", itens.len());
+                    println!("{} ofertas compatíveis!", itens.len());
                     resultados.extend(itens);
                 }
             }
@@ -499,6 +656,7 @@ async fn buscar_nas_lojas_confiaveis(
     resultados
 }
 
+// 1. Parser Kabum (__NEXT_DATA__)
 fn extrair_resultados_kabum(html: &str, modelo_chave: &str) -> Vec<OfertaComparada> {
     let mut encontrados = Vec::new();
     let doc = Html::parse_document(html);
@@ -572,7 +730,165 @@ fn coletar_produtos_kabum_json(val: &Value, modelo_chave: &str, lista: &mut Vec<
     }
 }
 
-fn extrair_resultados_genericos(
+// 2. Parser Amazon BR
+fn extrair_resultados_amazon(html: &str, modelo_chave: &str) -> Vec<OfertaComparada> {
+    let mut encontrados = Vec::new();
+    let doc = Html::parse_document(html);
+
+    let Ok(sel_card) = Selector::parse(r#"div[data-component-type="s-search-result"]"#) else {
+        return encontrados;
+    };
+    let sel_titulo = Selector::parse("h2 span").unwrap();
+    let sel_link = Selector::parse("h2 a[href], a.a-link-normal[href]").unwrap();
+    let sel_preco = Selector::parse("span.a-price span.a-offscreen").unwrap();
+
+    for card in doc.select(&sel_card).take(15) {
+        let titulo = card
+            .select(&sel_titulo)
+            .map(|el| el.text().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim()
+            .to_string();
+
+        if titulo.is_empty() {
+            continue;
+        }
+
+        if let Some(categoria_match) = avaliar_compatibilidade(modelo_chave, &titulo) {
+            if let Some(preco_el) = card.select(&sel_preco).next() {
+                let preco_txt = preco_el.text().collect::<Vec<_>>().join("");
+                if let Some(preco) = extrair_numero_brl(&preco_txt) {
+                    let href = card
+                        .select(&sel_link)
+                        .next()
+                        .and_then(|a| a.value().attr("href"))
+                        .unwrap_or("");
+
+                    let url_limpa = if href.starts_with("http") {
+                        href.split('?').next().unwrap_or(href).to_string()
+                    } else if !href.is_empty() {
+                        format!(
+                            "https://www.amazon.com.br{}",
+                            href.split('?').next().unwrap_or(href)
+                        )
+                    } else {
+                        continue;
+                    };
+
+                    if !encontrados.iter().any(|e| e.registro.url == url_limpa) {
+                        encontrados.push(OfertaComparada {
+                            registro: RegistroPreco {
+                                modelo_chave: modelo_chave.to_string(),
+                                titulo_loja: titulo,
+                                loja: "Amazon BR".to_string(),
+                                url: url_limpa,
+                                preco,
+                                data: Utc::now(),
+                            },
+                            categoria_match,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    encontrados
+}
+
+// 3. Parser Mercado Livre
+fn extrair_resultados_mercadolivre(html: &str, modelo_chave: &str) -> Vec<OfertaComparada> {
+    let mut encontrados = Vec::new();
+    let doc = Html::parse_document(html);
+
+    let Ok(sel_card) =
+        Selector::parse("li.ui-search-layout__item, div.ui-search-result__wrapper, div.poly-card")
+    else {
+        return encontrados;
+    };
+    let sel_titulo = Selector::parse(
+        "a.poly-component__title, h2.ui-search-item__title, a.ui-search-link__title-card",
+    )
+    .unwrap();
+    let sel_link = Selector::parse("a.poly-component__title[href], a.ui-search-link[href], a[href]").unwrap();
+    let sel_frac = Selector::parse(
+        ".poly-price__current .andes-money-amount__fraction, .ui-search-price__second-line .andes-money-amount__fraction, .andes-money-amount__fraction",
+    )
+    .unwrap();
+    let sel_cents = Selector::parse(
+        ".poly-price__current .andes-money-amount__cents, .ui-search-price__second-line .andes-money-amount__cents",
+    )
+    .unwrap();
+
+    for card in doc.select(&sel_card).take(15) {
+        let titulo = card
+            .select(&sel_titulo)
+            .next()
+            .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
+            .unwrap_or_default();
+
+        if titulo.is_empty() {
+            continue;
+        }
+
+        if let Some(categoria_match) = avaliar_compatibilidade(modelo_chave, &titulo) {
+            if let Some(frac_el) = card.select(&sel_frac).next() {
+                let inteiro_str: String = frac_el
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join("")
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect();
+
+                let centavos_str: String = card
+                    .select(&sel_cents)
+                    .next()
+                    .map(|el| {
+                        el.text()
+                            .collect::<Vec<_>>()
+                            .join("")
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect()
+                    })
+                    .filter(|s: &String| !s.is_empty())
+                    .unwrap_or_else(|| "00".to_string());
+
+                if let Ok(preco) = format!("{}.{}", inteiro_str, centavos_str).parse::<f64>() {
+                    let href = card
+                        .select(&sel_link)
+                        .next()
+                        .and_then(|a| a.value().attr("href"))
+                        .unwrap_or("");
+
+                    if href.starts_with("http") {
+                        let url_limpa = href.split('#').next().unwrap_or(href).to_string();
+                        if !encontrados.iter().any(|e| e.registro.url == url_limpa) {
+                            encontrados.push(OfertaComparada {
+                                registro: RegistroPreco {
+                                    modelo_chave: modelo_chave.to_string(),
+                                    titulo_loja: titulo,
+                                    loja: "Mercado Livre".to_string(),
+                                    url: url_limpa,
+                                    preco,
+                                    data: Utc::now(),
+                                },
+                                categoria_match,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    encontrados
+}
+
+// 4. Parser para Lojas Especializadas, High-End (Doctor Mouse, VTR Imports) e E-commerces
+fn extrair_resultados_lojas_especializadas(
     html: &str,
     loja: &str,
     url_base: &str,
@@ -582,7 +898,7 @@ fn extrair_resultados_genericos(
     let doc = Html::parse_document(html);
     let dominio_base = obter_dominio_base(loja);
 
-    // 1. Tenta via JSON-LD ItemList da busca
+    // Tentativa A: JSON-LD ItemList
     if let Ok(sel_ld) = Selector::parse(r#"script[type="application/ld+json"]"#) {
         for script in doc.select(&sel_ld) {
             if let Ok(json) = serde_json::from_str::<Value>(&script.inner_html()) {
@@ -624,24 +940,87 @@ fn extrair_resultados_genericos(
         }
     }
 
-    // 2. Fallback: varre os cards de links filtrando estritamente pela compatibilidade do modelo
+    // Tentativa B: Cards estruturados de Nuvemshop / Shopify / Tray (Doctor Mouse, VTR Imports, etc.)
     if encontrados.is_empty() {
-        let re_preco = Regex::new(r"R\$\s*(\d{1,3}(?:\.\d{3})*,\d{2})").unwrap();
+        if let Ok(sel_card) = Selector::parse(
+            ".js-item-product, .item-product, .card-wrapper, .product-item, .product-card",
+        ) {
+            let sel_nome = Selector::parse(
+                ".js-item-name, .item-name, .card__heading, .product-title, .product-name, h2, h3",
+            )
+            .unwrap();
+            let sel_preco = Selector::parse(
+                ".js-price-display, .item-price, .price-item--sale, .price-item--regular, .price",
+            )
+            .unwrap();
+            let sel_link = Selector::parse("a[href]").unwrap();
 
+            for card in doc.select(&sel_card).take(15) {
+                let nome = card
+                    .select(&sel_nome)
+                    .next()
+                    .map(|el| el.text().collect::<Vec<_>>().join(" ").trim().to_string())
+                    .unwrap_or_default();
+
+                if nome.is_empty() {
+                    continue;
+                }
+
+                if let Some(categoria_match) = avaliar_compatibilidade(modelo_chave, &nome) {
+                    let texto_preco = card
+                        .select(&sel_preco)
+                        .map(|el| el.text().collect::<Vec<_>>().join(" "))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    if let Some(preco) = extrair_numero_brl(&texto_preco) {
+                        let href = card
+                            .select(&sel_link)
+                            .next()
+                            .and_then(|a| a.value().attr("href"))
+                            .unwrap_or("");
+
+                        let url_completa = if href.starts_with("http") {
+                            href.to_string()
+                        } else if !href.is_empty() {
+                            format!("{}{}", dominio_base, href)
+                        } else {
+                            continue;
+                        };
+
+                        if !encontrados.iter().any(|e| e.registro.url == url_completa) {
+                            encontrados.push(OfertaComparada {
+                                registro: RegistroPreco {
+                                    modelo_chave: modelo_chave.to_string(),
+                                    titulo_loja: nome,
+                                    loja: loja.to_string(),
+                                    url: url_completa,
+                                    preco,
+                                    data: Utc::now(),
+                                },
+                                categoria_match,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Tentativa C: Fallback genérico em links que contenham título e valor em R$
+    if encontrados.is_empty() {
         if let Ok(sel_a) = Selector::parse("a[href]") {
             for a in doc.select(&sel_a) {
                 if encontrados.len() >= 6 {
                     break;
                 }
                 let texto = a.text().collect::<Vec<_>>().join(" ");
-                if let Some(caps) = re_preco.captures(&texto) {
+                if texto.contains("R$") {
                     let titulo_limpo = texto.split("R$").next().unwrap_or("").trim();
-
                     if let Some(categoria_match) =
                         avaliar_compatibilidade(modelo_chave, titulo_limpo)
                     {
-                        let valor_limpo = caps[1].replace('.', "").replace(',', ".");
-                        if let Ok(preco) = valor_limpo.parse::<f64>() {
+                        if let Some(preco) = extrair_numero_brl(&texto) {
                             let href = a.value().attr("href").unwrap_or("");
                             let url_completa = if href.starts_with("http") {
                                 href.to_string()
@@ -672,11 +1051,24 @@ fn extrair_resultados_genericos(
     encontrados
 }
 
+fn extrair_numero_brl(texto: &str) -> Option<f64> {
+    let re_brl = Regex::new(r"(\d{1,3}(?:\.\d{3})*,\d{2})").unwrap();
+    if let Some(caps) = re_brl.captures(texto) {
+        let limpo = caps[1].replace('.', "").replace(',', ".");
+        return limpo.parse::<f64>().ok();
+    }
+    None
+}
+
 fn obter_dominio_base(loja: &str) -> &'static str {
     match loja {
         "Kabum" => "https://www.kabum.com.br",
         "Pichau" => "https://www.pichau.com.br",
         "Terabyte" => "https://www.terabyteshop.com.br",
+        "Amazon BR" => "https://www.amazon.com.br",
+        "Mercado Livre" => "https://www.mercadolivre.com.br",
+        "Doctor Mouse" => "https://www.doctormouse.com.br",
+        "VTR Imports" => "https://www.vtrimports.com.br",
         "Farfetch" => "https://www.farfetch.com",
         "Droper" => "https://droper.app",
         "Maze" => "https://www.maze.com.br",
@@ -712,6 +1104,32 @@ fn extrair_preco_html(documento: &Html) -> Option<f64> {
                         if num > 0.0 {
                             return Some(num);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback para páginas de produto de marketplaces (Amazon / Mercado Livre / Nuvemshop)
+    let seletores_visuais = [
+        "span.a-price span.a-offscreen",
+        ".ui-pdp-price__second-line .andes-money-amount__fraction",
+        ".js-price-display",
+    ];
+
+    for sel_str in seletores_visuais {
+        if let Ok(sel) = Selector::parse(sel_str) {
+            if let Some(el) = documento.select(&sel).next() {
+                let txt = el.text().collect::<Vec<_>>().join("");
+                if let Some(num) = extrair_numero_brl(&txt) {
+                    if num > 0.0 {
+                        return Some(num);
+                    }
+                }
+                let apenas_digitos: String = txt.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(num) = apenas_digitos.parse::<f64>() {
+                    if num > 0.0 {
+                        return Some(num);
                     }
                 }
             }
@@ -779,6 +1197,14 @@ fn identificar_loja(url: &str) -> &'static str {
         "Pichau"
     } else if u.contains("terabyteshop") {
         "Terabyte"
+    } else if u.contains("amazon") {
+        "Amazon BR"
+    } else if u.contains("mercadolivre") {
+        "Mercado Livre"
+    } else if u.contains("doctormouse") {
+        "Doctor Mouse"
+    } else if u.contains("vtrimports") {
+        "VTR Imports"
     } else if u.contains("farfetch") {
         "Farfetch"
     } else if u.contains("droper") {
@@ -799,38 +1225,16 @@ fn detectar_nicho(url: &str) -> Nicho {
     }
 }
 
-fn carregar_historico() -> Vec<RegistroPreco> {
-    if Path::new(ARQUIVO_HISTORICO).exists() {
-        if let Ok(conteudo) = fs::read_to_string(ARQUIVO_HISTORICO) {
-            if let Ok(dados) = serde_json::from_str::<Vec<RegistroPreco>>(&conteudo) {
-                return dados;
-            }
-        }
-    }
-    Vec::new()
-}
-
-fn salvar_historico(historico: &[RegistroPreco]) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(historico)?;
-    fs::write(ARQUIVO_HISTORICO, json)?;
-    Ok(())
-}
-
 fn gerar_veredito_completo(
-    historico: &[RegistroPreco],
+    conn: &Connection,
     alvo: &RegistroPreco,
     ofertas_outras_lojas: &[OfertaComparada],
-) {
+) -> Result<(), rusqlite::Error> {
     println!("=========================================================");
     println!("  VEREDITO BLACK FRIDAY: {}", alvo.modelo_chave);
     println!("=========================================================");
 
-    let limite_30_dias = Utc::now() - Duration::days(30);
-
-    let registros_30d: Vec<&RegistroPreco> = historico
-        .iter()
-        .filter(|r| r.modelo_chave == alvo.modelo_chave && r.data >= limite_30_dias)
-        .collect();
+    let registros_30d = buscar_historico_30_dias(conn, &alvo.modelo_chave)?;
 
     let media_30d = if registros_30d.is_empty() {
         alvo.preco
@@ -841,7 +1245,7 @@ fn gerar_veredito_completo(
 
     println!("• Seu link ({}): R$ {:.2}", alvo.loja, alvo.preco);
     println!(
-        "• Média de 30 dias ({} registros): R$ {:.2}",
+        "• Média de 30 dias no SQLite ({} registros): R$ {:.2}",
         registros_30d.len(),
         media_30d
     );
@@ -882,7 +1286,7 @@ fn gerar_veredito_completo(
         );
     } else {
         println!("\n💡 ACHAMOS OPÇÕES MAIS BARATAS EM LOJAS CONFIÁVEIS:");
-        for (idx, oferta) in ofertas_mais_baratas.iter().take(4).enumerate() {
+        for (idx, oferta) in ofertas_mais_baratas.iter().take(5).enumerate() {
             println!(
                 "  {}. [{}] [{}] R$ {:.2} (economia de R$ {:.2})\n     Produto: {}\n     Link: {}",
                 idx + 1,
@@ -896,4 +1300,6 @@ fn gerar_veredito_completo(
         }
     }
     println!("=========================================================\n");
+
+    Ok(())
 }
