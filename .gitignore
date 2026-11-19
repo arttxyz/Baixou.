@@ -1,2 +1,6 @@
 /target
 *.db
+
+node_modules/
+dist/
+.env

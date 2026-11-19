@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="baixou">
+  <g transform="translate(256,256) scale(1.12) translate(-255.5,-256)">
+    <path d="M92 256 L172 156 Q180 146 194 146 L398 146 Q418 146 418 166 L418 346 Q418 366 398 366 L194 366 Q180 366 172 356 Z"
+          fill="#07090D" stroke="#9DF7C4" stroke-width="16" stroke-linejoin="round"/>
+    <circle cx="186" cy="256" r="18" fill="none" stroke="#9DF7C4" stroke-width="10"/>
+    <path d="M236 202 L288 252 L318 222 L363 289" fill="none" stroke="#FFFFFF" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+    <polygon points="347,301 379,277 386,320" fill="#9DF7C4" stroke="#9DF7C4" stroke-width="10" stroke-linejoin="round"/>
+  </g>
+</svg>

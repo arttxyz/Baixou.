@@ -1,23 +1,26 @@
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{Html, IntoResponse},
-    routing::{get, post},
+    extract::{Path, State},
+    http::{HeaderMap as AxumHeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
 use headless_chrome::{Browser, LaunchOptions};
 use regex::Regex;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use scraper::{Html as ScraperHtml, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration as StdDuration;
+use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct RegistroPreco {
@@ -32,7 +35,7 @@ struct RegistroPreco {
 #[derive(Debug, Clone)]
 struct OfertaComparada {
     registro: RegistroPreco,
-    categoria_match: &'static str, // "MESMO MODELO" ou "SEMELHANTE"
+    categoria_match: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,15 +71,71 @@ struct OfertaWeb {
 }
 
 #[derive(Serialize)]
+struct PontoGrafico {
+    data: String,
+    preco: f64,
+    loja: String,
+    titulo_loja: String,
+}
+
+#[derive(Serialize)]
 struct AnaliseResponse {
     produto_alvo: RegistroPreco,
     nicho: String,
     media_30_dias: f64,
     total_registros_30d: usize,
     variacao_percentual: f64,
-    status_veredito: String, // "PROMOCAO", "INFLADO", "NORMAL"
+    status_veredito: String,
     mensagem_veredito: String,
     ofertas_mais_baratas: Vec<OfertaWeb>,
+    historico_grafico: Vec<PontoGrafico>,
+}
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    nome: String,
+    email: String,
+    senha: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    senha: String,
+}
+
+#[derive(Serialize)]
+struct UsuarioPublico {
+    id: i64,
+    nome: String,
+    email: String,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    token: String,
+    usuario: UsuarioPublico,
+}
+
+#[derive(Deserialize)]
+struct NovoFavoritoRequest {
+    modelo_chave: String,
+    titulo_loja: String,
+    loja: String,
+    url: String,
+    preco_salvo: f64,
+}
+
+#[derive(Serialize)]
+struct FavoritoItem {
+    id: i64,
+    modelo_chave: String,
+    titulo_loja: String,
+    loja: String,
+    url: String,
+    preco_salvo: f64,
+    menor_preco_atual: f64,
+    criado_em: String,
 }
 
 #[derive(Serialize)]
@@ -96,17 +155,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client,
     });
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     let app = Router::new()
-        .route("/", get(servir_frontend))
+        .route("/", get(health_check))
+        // Rotas de Análise e Gráficos
         .route("/api/analisar", post(api_analisar_link))
         .route("/api/historico", get(api_listar_historico))
+        .route("/api/grafico/:modelo", get(api_dados_grafico))
+        // Rotas de Autenticação
+        .route("/api/auth/register", post(api_register))
+        .route("/api/auth/login", post(api_login))
+        .route("/api/auth/me", get(api_me))
+        // Rotas de Favoritos / Monitoramento do Usuário
+        .route("/api/favoritos", get(api_listar_favoritos).post(api_salvar_favorito))
+        .route("/api/favoritos/:id", delete(api_remover_favorito))
+        .layer(cors)
         .with_state(state);
 
     let endereco = "0.0.0.0:3000";
     println!("=========================================================");
-    println!("   BAIXOU WEB API & INTERFACE VISUAL ONLINE              ");
-    println!("   Acesse no navegador: http://localhost:3000            ");
-    println!("   Banco de dados SQLite: {}                      ", ARQUIVO_BANCO);
+    println!("   BAIXOU API REST FULL-STACK ONLINE (PORTA 3000)        ");
+    println!("   Banco SQLite: {} (Auth + Histórico + Favoritos) ", ARQUIVO_BANCO);
+    println!("   Pronto para conectar ao Frontend React/Vite           ");
     println!("=========================================================");
 
     let listener = tokio::net::TcpListener::bind(endereco).await?;
@@ -115,27 +189,343 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn health_check() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "online",
+        "servico": "Baixou API v2",
+        "docs": "Conecte seu frontend React/Vite em http://localhost:3000"
+    }))
+}
+
 // =========================================================================
-// ROTAS WEB (AXUM)
+// AUTENTICAÇÃO E GESTÃO DE CONTAS
 // =========================================================================
 
-async fn servir_frontend() -> impl IntoResponse {
-    match tokio::fs::read_to_string("index.html").await {
-        Ok(html) => Html(html).into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            "Arquivo index.html nao encontrado na raiz do projeto.",
+fn hash_senha(senha: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("baixou_salt_seguro_2026:{}", senha).as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn extrair_usuario_autenticado(headers: &AxumHeaderMap, conn: &Connection) -> Option<UsuarioPublico> {
+    let auth = headers.get("authorization")?.to_str().ok()?;
+    let token = auth.strip_prefix("Bearer ")?.trim();
+
+    conn.query_row(
+        "SELECT u.id, u.nome, u.email
+         FROM sessoes s
+         JOIN usuarios u ON u.id = s.usuario_id
+         WHERE s.token = ?1",
+        params![token],
+        |row| {
+            Ok(UsuarioPublico {
+                id: row.get(0)?,
+                nome: row.get(1)?,
+                email: row.get(2)?,
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+async fn api_register(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    let nome = payload.nome.trim().to_string();
+    let email = payload.email.trim().to_lowercase();
+    let senha = payload.senha.trim().to_string();
+
+    if nome.len() < 2 || !email.contains('@') || senha.len() < 6 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErroResponse {
+                erro: "Preencha nome válido, e-mail válido e senha com no mínimo 6 caracteres."
+                    .to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let conn = state.db.lock().unwrap();
+
+    let existe: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM usuarios WHERE email = ?1)",
+            params![email],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if existe {
+        return (
+            StatusCode::CONFLICT,
+            Json(ErroResponse {
+                erro: "Este e-mail já está cadastrado.".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let senha_hash = hash_senha(&senha);
+    let agora = Utc::now().to_rfc3339();
+
+    if let Err(e) = conn.execute(
+        "INSERT INTO usuarios (nome, email, senha_hash, criado_em) VALUES (?1, ?2, ?3, ?4)",
+        params![nome, email, senha_hash, agora],
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErroResponse {
+                erro: format!("Erro ao criar conta: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
+    let usuario_id = conn.last_insert_rowid();
+    let token = Uuid::new_v4().to_string();
+
+    let _ = conn.execute(
+        "INSERT INTO sessoes (token, usuario_id, criado_em) VALUES (?1, ?2, ?3)",
+        params![token, usuario_id, agora],
+    );
+
+    (
+        StatusCode::CREATED,
+        Json(AuthResponse {
+            token,
+            usuario: UsuarioPublico {
+                id: usuario_id,
+                nome,
+                email,
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn api_login(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<LoginRequest>,
+) -> impl IntoResponse {
+    let email = payload.email.trim().to_lowercase();
+    let senha_hash = hash_senha(payload.senha.trim());
+
+    let conn = state.db.lock().unwrap();
+
+    let usuario_opt = conn
+        .query_row(
+            "SELECT id, nome, email FROM usuarios WHERE email = ?1 AND senha_hash = ?2",
+            params![email, senha_hash],
+            |row| {
+                Ok(UsuarioPublico {
+                    id: row.get(0)?,
+                    nome: row.get(1)?,
+                    email: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .unwrap_or(None);
+
+    let Some(usuario) = usuario_opt else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "E-mail ou senha incorretos.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let token = Uuid::new_v4().to_string();
+    let agora = Utc::now().to_rfc3339();
+
+    let _ = conn.execute(
+        "INSERT INTO sessoes (token, usuario_id, criado_em) VALUES (?1, ?2, ?3)",
+        params![token, usuario.id, agora],
+    );
+
+    (StatusCode::OK, Json(AuthResponse { token, usuario })).into_response()
+}
+
+async fn api_me(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    match extrair_usuario_autenticado(&headers, &conn) {
+        Some(usuario) => (StatusCode::OK, Json(usuario)).into_response(),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Sessão inválida ou expirada.".to_string(),
+            }),
         )
             .into_response(),
     }
 }
 
+// =========================================================================
+// FAVORITOS / LISTA DE MONITORAMENTO DO USUÁRIO
+// =========================================================================
+
+async fn api_listar_favoritos(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Faça login para ver seus itens salvos.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, modelo_chave, titulo_loja, loja, url, preco_salvo, criado_em
+             FROM favoritos
+             WHERE usuario_id = ?1
+             ORDER BY id DESC",
+        )
+        .unwrap();
+
+    let rows = stmt
+        .query_map(params![usuario.id], |row| {
+            let modelo: String = row.get(1)?;
+            let preco_salvo: f64 = row.get(5)?;
+
+            let menor_atual: f64 = conn
+                .query_row(
+                    "SELECT MIN(preco) FROM historico_precos WHERE modelo_chave = ?1",
+                    params![modelo],
+                    |r| r.get::<_, Option<f64>>(0),
+                )
+                .unwrap_or(None)
+                .unwrap_or(preco_salvo);
+
+            Ok(FavoritoItem {
+                id: row.get(0)?,
+                modelo_chave: modelo,
+                titulo_loja: row.get(2)?,
+                loja: row.get(3)?,
+                url: row.get(4)?,
+                preco_salvo,
+                menor_preco_atual: menor_atual,
+                criado_em: row.get(6)?,
+            })
+        })
+        .unwrap();
+
+    let mut lista = Vec::new();
+    for item in rows {
+        if let Ok(fav) = item {
+            lista.push(fav);
+        }
+    }
+
+    (StatusCode::OK, Json(lista)).into_response()
+}
+
+async fn api_salvar_favorito(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+    Json(payload): Json<NovoFavoritoRequest>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Faça login para salvar produtos na sua lista.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let agora = Utc::now().to_rfc3339();
+    if let Err(e) = conn.execute(
+        "INSERT INTO favoritos (usuario_id, modelo_chave, titulo_loja, loja, url, preco_salvo, criado_em)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            usuario.id,
+            payload.modelo_chave,
+            payload.titulo_loja,
+            payload.loja,
+            payload.url,
+            payload.preco_salvo,
+            agora
+        ],
+    ) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErroResponse {
+                erro: format!("Erro ao salvar favorito: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "ok": true, "id": conn.last_insert_rowid() })),
+    )
+        .into_response()
+}
+
+async fn api_remover_favorito(
+    State(state): State<Arc<AppState>>,
+    headers: AxumHeaderMap,
+    Path(fav_id): Path<i64>,
+) -> impl IntoResponse {
+    let conn = state.db.lock().unwrap();
+    let Some(usuario) = extrair_usuario_autenticado(&headers, &conn) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErroResponse {
+                erro: "Não autorizado.".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let _ = conn.execute(
+        "DELETE FROM favoritos WHERE id = ?1 AND usuario_id = ?2",
+        params![fav_id, usuario.id],
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+// =========================================================================
+// ANÁLISE DE LINKS, HISTÓRICO E SÉRIE TEMPORAL PARA GRÁFICOS
+// =========================================================================
+
 async fn api_listar_historico(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registros = {
         let conn = state.db.lock().unwrap();
-        buscar_ultimos_registros(&conn, 12).unwrap_or_default()
+        buscar_ultimos_registros(&conn, 15).unwrap_or_default()
     };
     Json(registros)
+}
+
+async fn api_dados_grafico(
+    State(state): State<Arc<AppState>>,
+    Path(modelo): Path<String>,
+) -> impl IntoResponse {
+    let modelo_limpo = modelo.trim().to_uppercase();
+    let pontos = {
+        let conn = state.db.lock().unwrap();
+        buscar_serie_grafico(&conn, &modelo_limpo).unwrap_or_default()
+    };
+    Json(pontos)
 }
 
 async fn api_analisar_link(
@@ -160,41 +550,34 @@ async fn api_analisar_link(
         Nicho::Moda => "Moda & Streetwear",
     };
 
-    println!("\n[API] Nova requisição recebida: {} ({})", loja_origem, url);
+    println!("\n[API] Analisando: {} ({})", loja_origem, url);
 
     let produto_alvo = match extrair_produto_da_url(&state.client, &url, loja_origem, &nicho).await
     {
         Ok(prod) => prod,
         Err(erro) => {
-            println!("[API] Falha ao extrair produto: {}", erro);
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(ErroResponse { erro })).into_response();
         }
     };
 
-    println!(
-        "[API] Identificado: {} | Modelo: {} | R$ {:.2}",
-        produto_alvo.titulo_loja, produto_alvo.modelo_chave, produto_alvo.preco
-    );
-
-    // Salva o produto consultado no SQLite (sem segurar o lock durante requisições HTTP)
     {
         let conn = state.db.lock().unwrap();
         let _ = inserir_registro(&conn, &produto_alvo);
     }
 
-    // Varre as outras lojas confiáveis
     let ofertas_encontradas =
         buscar_nas_lojas_confiaveis(&state.client, &produto_alvo, &nicho).await;
 
-    // Salva ofertas do mesmo modelo e calcula média de 30 dias no SQLite
-    let registros_30d = {
+    let (registros_30d, historico_grafico) = {
         let conn = state.db.lock().unwrap();
         for oferta in &ofertas_encontradas {
             if oferta.categoria_match == "MESMO MODELO" {
                 let _ = inserir_registro(&conn, &oferta.registro);
             }
         }
-        buscar_historico_30_dias(&conn, &produto_alvo.modelo_chave).unwrap_or_default()
+        let r30 = buscar_historico_30_dias(&conn, &produto_alvo.modelo_chave).unwrap_or_default();
+        let graf = buscar_serie_grafico(&conn, &produto_alvo.modelo_chave).unwrap_or_default();
+        (r30, graf)
     };
 
     let media_30d = if registros_30d.is_empty() {
@@ -248,7 +631,7 @@ async fn api_analisar_link(
 
     let ofertas_web: Vec<OfertaWeb> = mais_baratas
         .into_iter()
-        .take(6)
+        .take(8)
         .map(|o| OfertaWeb {
             categoria_match: o.categoria_match.to_string(),
             loja: o.registro.loja.clone(),
@@ -258,12 +641,6 @@ async fn api_analisar_link(
             url: o.registro.url.clone(),
         })
         .collect();
-
-    println!(
-        "[API] Análise concluída para '{}'. {} ofertas mais baratas enviadas ao frontend.",
-        produto_alvo.modelo_chave,
-        ofertas_web.len()
-    );
 
     (
         StatusCode::OK,
@@ -276,6 +653,7 @@ async fn api_analisar_link(
             status_veredito,
             mensagem_veredito,
             ofertas_mais_baratas: ofertas_web,
+            historico_grafico,
         }),
     )
         .into_response()
@@ -303,6 +681,40 @@ fn inicializar_banco() -> Result<Connection, rusqlite::Error> {
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_modelo_data ON historico_precos (modelo_chave, data_coleta)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            senha_hash TEXT NOT NULL,
+            criado_em TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessoes (
+            token TEXT PRIMARY KEY,
+            usuario_id INTEGER NOT NULL,
+            criado_em TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS favoritos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL,
+            modelo_chave TEXT NOT NULL,
+            titulo_loja TEXT NOT NULL,
+            loja TEXT NOT NULL,
+            url TEXT NOT NULL,
+            preco_salvo REAL NOT NULL,
+            criado_em TEXT NOT NULL
+        )",
         [],
     )?;
 
@@ -359,6 +771,35 @@ fn buscar_historico_30_dias(
     }
 
     Ok(registros)
+}
+
+fn buscar_serie_grafico(
+    conn: &Connection,
+    modelo_chave: &str,
+) -> Result<Vec<PontoGrafico>, rusqlite::Error> {
+    let limite_30_dias = (Utc::now() - Duration::days(30)).to_rfc3339();
+
+    let mut stmt = conn.prepare(
+        "SELECT data_coleta, preco, loja, titulo_loja
+         FROM historico_precos
+         WHERE modelo_chave = ?1 AND data_coleta >= ?2
+         ORDER BY id ASC",
+    )?;
+
+    let linhas = stmt.query_map(params![modelo_chave, limite_30_dias], |row| {
+        Ok(PontoGrafico {
+            data: row.get(0)?,
+            preco: row.get(1)?,
+            loja: row.get(2)?,
+            titulo_loja: row.get(3)?,
+        })
+    })?;
+
+    let mut pontos = Vec::new();
+    for p in linhas {
+        pontos.push(p?);
+    }
+    Ok(pontos)
 }
 
 fn buscar_ultimos_registros(
