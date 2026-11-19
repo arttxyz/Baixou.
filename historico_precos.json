@@ -1,10 +1,50 @@
 [
   {
-    "grupo_produto": "RTX 5060",
-    "titulo_loja": "Placa de Vídeo MSI GeForce RTX 5060 GAMING TRIO OC NVIDIA, 8GB GDDR7, 128-bits, Triple Fan, DLSS 4 - 912-V537-021",
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Gamer Sem Fio Razer Viper V3 Pro SE, 35000 DPI, Ultra-Leve, Edição Especial, Preto - RZ01-04550100",
     "loja": "Kabum",
-    "url": "https://www.kabum.com.br/produto/1078277/placa-de-video-nvidia-msi-rtx-5060-8gb-gddr7-128bits-gaming-trio-oc-msi-912-v537-021",
-    "preco": 3399.99,
-    "data": "2026-11-19T13:06:52.058751300Z"
+    "url": "https://www.kabum.com.br/produto/998457/mouse-gamer-sem-fio-razer-viper-v3-pro-se-35000-dpi-ultra-leve-edicao-especial-preto-rz01-04550100",
+    "preco": 579.99,
+    "data": "2026-11-19T13:21:46.658606Z"
+  },
+  {
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Razer Viper V3 Pro + Griptape Cor:preto",
+    "loja": "Kabum",
+    "url": "https://www.kabum.com.br/produto/632862/mouse-gamer-razer-viper-v3-pro-54g-ultraleve-com-dongle-8k-95hr-de-bateria-recarregavel-35000-dpi-blacj",
+    "preco": 1610.0,
+    "data": "2026-11-19T13:21:47.873225Z"
+  },
+  {
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Razer Viper V3 Pro X Sentinels + Griptape",
+    "loja": "Kabum",
+    "url": "https://www.kabum.com.br/produto/776317/mouse-gamer-razer-viper-v3-pro-x-sentinels",
+    "preco": 2059.0,
+    "data": "2026-11-19T13:21:47.873237500Z"
+  },
+  {
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Gamer sem Fio Razer Viper V3 Pro, Wireless, Ergonômico para Esports, Preto - RZ0105120100",
+    "loja": "Kabum",
+    "url": "https://www.kabum.com.br/produto/641737/mouse-gamer-sem-fio-razer-viper-v3-pro-wireless-ergonomico-para-esports-preto-rz0105120100",
+    "preco": 2599.99,
+    "data": "2026-11-19T13:21:47.873277700Z"
+  },
+  {
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Gamer Sem Fio Razer Viper V3 Pro White Edition, Sensor Focus Pro, 35000 DPI, Bateria 95h, Polling Rate 8000Hz, Branco - RZ01-05120200",
+    "loja": "Kabum",
+    "url": "https://www.kabum.com.br/produto/921185/mouse-gamer-sem-fio-razer-viper-v3-pro-white-edition-sensor-focus-pro-35000-dpi-bateria-95h-polling-rate-8000hz-branco-rz01-05120200",
+    "preco": 1459.99,
+    "data": "2026-11-19T13:21:47.873305100Z"
+  },
+  {
+    "modelo_chave": "RAZER VIPER V3 PRO",
+    "titulo_loja": "Mouse Gamer Sem Fio Razer Viper V3 Pro, Sensor Focus Pro, 35000 DPI, Bateria 95h, Polling Rate 8000Hz, Preto - RZ01-05120100",
+    "loja": "Kabum",
+    "url": "https://www.kabum.com.br/produto/921184/mouse-gamer-sem-fio-razer-viper-v3-pro-sensor-focus-pro-35000-dpi-bateria-95h-polling-rate-8000hz-preto-rz01-05120100",
+    "preco": 1599.99,
+    "data": "2026-11-19T13:21:47.873324Z"
   }
 ]
