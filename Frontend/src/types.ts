@@ -27,6 +27,7 @@ export type Offer = {
 }
 
 export type AnalysisResult = {
+  modo_busca?: 'LINK' | 'NOME'
   produto_alvo: ProductTarget
   nicho: string
   media_30_dias: number

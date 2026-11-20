@@ -47,6 +47,10 @@ button:disabled { cursor: not-allowed; }
   .orbit-label-three { bottom: 45px; left: 88px; color: #8fa8ff; }
   .search-card { @apply panel relative overflow-hidden p-5 sm:p-6; background-image: radial-gradient(circle at 100% 0%, rgba(157,247,196,.06), transparent 35%); }
   .search-input-row { @apply flex flex-col gap-2.5 lg:flex-row; }
+  .search-mode-toggle { @apply flex items-center rounded-lg border border-white/[.08] bg-white/[.025] p-1; }
+  .search-mode-toggle button { @apply inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[10px] font-bold text-slate-500 transition hover:text-slate-200; }
+  .search-mode-toggle .search-mode-active { @apply bg-white/[.08] text-white; }
+  .nicho-select { @apply h-8 rounded-lg border border-white/[.08] bg-[#111720] px-2.5 text-[10px] font-bold text-slate-400 outline-none transition hover:border-mint/30 focus:border-mint/40; }
   .search-input { @apply flex h-12 flex-1 items-center gap-3 rounded-xl border border-white/10 bg-black/20 px-3.5 transition focus-within:border-mint/50 focus-within:ring-2 focus-within:ring-mint/10; }
   .search-input input { @apply min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-slate-600; }
   .paste-button { @apply flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-[10px] font-bold uppercase tracking-[.1em] text-slate-400 transition hover:border-mint/30 hover:bg-mint/10 hover:text-mint; }

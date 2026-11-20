@@ -24,6 +24,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 export const api = {
   analyze: (url: string) => request<AnalysisResult>('/api/analisar', { method: 'POST', body: JSON.stringify({ url }) }),
+  search: (termo: string, nicho: string) => request<AnalysisResult>('/api/buscar', { method: 'POST', body: JSON.stringify({ termo, nicho }) }),
   chart: (model: string) => request<PricePoint[]>(`/api/grafico/${encodeURIComponent(model)}`),
   history: () => request<HistoryRecord[]>('/api/historico'),
   register: (body: { nome: string; email: string; senha: string }) => request<AuthResponse>('/api/auth/register', { method: 'POST', body: JSON.stringify(body) }),
